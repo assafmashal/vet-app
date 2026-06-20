@@ -1,0 +1,157 @@
+name: Deploy to EKS
+
+on:
+  workflow_dispatch:
+    inputs:
+      image_tag:
+        description: 'Image tag to deploy (SHA or "latest")'
+        required: false
+        default: 'latest'
+
+jobs:
+  deploy:
+    name: Deploy to EKS
+    runs-on: ubuntu-latest
+    environment: production   # requires approval from configured reviewers in GitHub Settings
+    permissions:
+      id-token: write   # required to request a JWT from GitHub's OIDC provider
+      contents: read    # required to checkout the repo
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: us-east-1
+
+      - name: Update kubeconfig
+        run: aws eks update-kubeconfig --name teyavet-prod --region us-east-1
+
+      - name: Install Helm
+        uses: azure/setup-helm@v4
+
+      - name: Apply namespace
+        run: kubectl apply -f k8s/namespace.yaml
+
+      - name: Install / upgrade AWS Load Balancer Controller
+        run: |
+          ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+          VPC_ID=$(aws eks describe-cluster --name teyavet-prod \
+            --query 'cluster.resourcesVpcConfig.vpcId' --output text)
+
+          helm repo add eks https://aws.github.io/eks-charts
+          helm repo update eks
+
+          # --install makes this idempotent (install on first run, upgrade on subsequent)
+          # --wait blocks until the LBC pods are Running and its webhook is ready,
+          # so the Ingress resource applied later is reconciled immediately.
+          helm upgrade --install aws-load-balancer-controller eks/aws-load-balancer-controller \
+            -n kube-system \
+            --set clusterName=teyavet-prod \
+            --set serviceAccount.create=true \
+            --set serviceAccount.name=aws-load-balancer-controller \
+            --set "serviceAccount.annotations.eks\\.amazonaws\\.com/role-arn=arn:aws:iam::${ACCOUNT_ID}:role/teyavet-lbc-role" \
+            --set region=us-east-1 \
+            --set vpcId="${VPC_ID}" \
+            --wait --timeout 3m
+
+      - name: Create / update K8s Secret
+        run: |
+          kubectl create secret generic backend-secrets \
+            --namespace teyavet \
+            --from-literal=DB_PASSWORD="${{ secrets.DB_PASSWORD }}" \
+            --from-literal=JWT_SECRET_KEY="${{ secrets.JWT_SECRET_KEY }}" \
+            --dry-run=client -o yaml | kubectl apply -f -
+
+      - name: Apply / update ConfigMap
+        run: |
+          # Apply with RDS_HOST resolved now; ALB_DNS will be corrected after ingress provisioning.
+          RDS_HOST=$(aws rds describe-db-instances \
+            --db-instance-identifier teyavet-mysql \
+            --query 'DBInstances[0].Endpoint.Address' \
+            --output text)
+          export RDS_HOST ALB_DNS="${{ secrets.ALB_DNS }}"
+          envsubst < k8s/backend/configmap.yaml | kubectl apply -f -
+
+      - name: Create ConfigMap with SQL migration files
+        run: |
+          kubectl create configmap db-sql \
+            --namespace teyavet \
+            --from-file=schema.sql=db/init/schema.sql \
+            --from-file=seed_data.sql=db/init/seed_data.sql \
+            --dry-run=client -o yaml | kubectl apply -f -
+
+      - name: Run database migration
+        run: |
+          # Delete any previous migration job so we can re-run cleanly
+          kubectl delete job db-migrate -n teyavet --ignore-not-found
+          kubectl apply -f k8s/backend/migration-job.yaml
+          kubectl wait --for=condition=complete job/db-migrate \
+            -n teyavet --timeout=120s
+          kubectl logs -n teyavet -l job-name=db-migrate
+
+      - name: Apply Services and Ingress
+        run: |
+          kubectl apply -f k8s/backend/service.yaml
+          kubectl apply -f k8s/frontend/service.yaml
+          kubectl apply -f k8s/ingress.yaml
+
+      - name: Wait for ALB and refresh ConfigMap with live hostname
+        run: |
+          # The Load Balancer Controller provisions the ALB asynchronously after the
+          # Ingress is created. Poll until we have a hostname (usually 1-2 min).
+          echo "Waiting for ALB hostname..."
+          ALB=""
+          for i in $(seq 1 18); do
+            ALB=$(kubectl get ingress teyavet-ingress -n teyavet \
+              -o jsonpath='{.status.loadBalancer.ingress[0].hostname}' 2>/dev/null)
+            [[ -n "$ALB" ]] && break
+            echo "  (${i}0s) still provisioning..."
+            sleep 10
+          done
+          if [[ -z "$ALB" ]]; then
+            echo "ALB not ready after 3 min — falling back to ALB_DNS secret (may be stale)"
+            ALB="${{ secrets.ALB_DNS }}"
+          fi
+          echo "ALB_DNS=${ALB}" >> "$GITHUB_ENV"
+          # Re-apply ConfigMap so CORS_ORIGINS has the live hostname before pods start
+          RDS_HOST=$(aws rds describe-db-instances \
+            --db-instance-identifier teyavet-mysql \
+            --query 'DBInstances[0].Endpoint.Address' \
+            --output text)
+          export RDS_HOST ALB_DNS="$ALB"
+          envsubst < k8s/backend/configmap.yaml | kubectl apply -f -
+          echo "ConfigMap updated — CORS_ORIGINS=http://${ALB}"
+
+      - name: Deploy backend
+        run: |
+          ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+          sed "s|AWS_ACCOUNT_ID|${ACCOUNT_ID}|g" k8s/backend/deployment.yaml \
+            | sed "s|:latest|:${{ github.event.inputs.image_tag }}|g" \
+            | kubectl apply -f -
+
+      - name: Deploy frontend
+        run: |
+          ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+          sed "s|AWS_ACCOUNT_ID|${ACCOUNT_ID}|g" k8s/frontend/deployment.yaml \
+            | sed "s|:latest|:${{ github.event.inputs.image_tag }}|g" \
+            | kubectl apply -f -
+
+      - name: Force rollout restart when using latest tag
+        if: ${{ github.event.inputs.image_tag == 'latest' }}
+        run: |
+          kubectl rollout restart deployment/backend deployment/frontend -n teyavet
+
+      - name: Wait for rollout
+        run: |
+          kubectl rollout status deployment/backend -n teyavet --timeout=120s
+          kubectl rollout status deployment/frontend -n teyavet --timeout=120s
+
+      - name: Print app URL
+        run: |
+          echo "========================================"
+          echo "  App URL : http://${ALB_DNS}"
+          echo "  Health  : http://${ALB_DNS}/health"
+          echo "========================================"

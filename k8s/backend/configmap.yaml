@@ -1,0 +1,14 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: backend-config
+  namespace: teyavet
+data:
+  FLASK_APP: "backend.app"
+  DB_PORT: "3306"
+  DB_USER: "vetadmin"
+  DB_NAME: "vet"
+  # Applied via: envsubst < k8s/backend/configmap.yaml | kubectl apply -f -
+  # RDS_HOST and ALB_DNS are substituted from GitHub Secrets at deploy time
+  DB_HOST: "${RDS_HOST}"
+  CORS_ORIGINS: "http://${ALB_DNS}"

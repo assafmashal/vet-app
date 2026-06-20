@@ -1,0 +1,117 @@
+name: Terraform — Apply Infrastructure
+
+on:
+  workflow_dispatch:
+
+jobs:
+  terraform:
+    name: Bootstrap + Apply
+    runs-on: ubuntu-latest
+    environment: production   # requires manual approval in GitHub Settings
+    permissions:
+      id-token: write   # required to request a JWT from GitHub's OIDC provider
+      contents: read    # required to checkout the repo
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: us-east-1
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "~1.6"
+
+      # ── Phase 1: Bootstrap ─────────────────────────────────────────────────
+      # Creates the S3 bucket + DynamoDB table used as the Terraform backend.
+      # Safe to re-run: if the bucket already exists Terraform will just confirm
+      # no changes are needed.
+
+      - name: Bootstrap — init
+        working-directory: infra/bootstrap
+        run: terraform init
+
+      - name: Bootstrap — import existing resources
+        working-directory: infra/bootstrap
+        run: |
+          # The S3 bucket and DynamoDB table may already exist from a previous run.
+          # Import them into state so apply sees no diff instead of failing with
+          # BucketAlreadyExists / ResourceInUseException.
+          ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+          echo "ACCOUNT_ID=${ACCOUNT_ID}" >> $GITHUB_ENV
+          terraform import aws_s3_bucket.tf_state "teyavet-terraform-state-${ACCOUNT_ID}" 2>/dev/null || true
+          terraform import aws_dynamodb_table.tf_lock "teyavet-terraform-locks" 2>/dev/null || true
+          terraform import aws_s3_bucket_versioning.tf_state "teyavet-terraform-state-${ACCOUNT_ID}" 2>/dev/null || true
+          terraform import aws_s3_bucket_server_side_encryption_configuration.tf_state "teyavet-terraform-state-${ACCOUNT_ID}" 2>/dev/null || true
+          terraform import aws_s3_bucket_public_access_block.tf_state "teyavet-terraform-state-${ACCOUNT_ID}" 2>/dev/null || true
+
+      - name: Bootstrap — apply
+        working-directory: infra/bootstrap
+        run: terraform apply -auto-approve
+
+      # ── Phase 2: Main infrastructure ───────────────────────────────────────
+      # Provisions VPC, EKS, RDS, ECR, IAM roles, and security groups.
+      # Takes ~15 minutes on a fresh account (EKS cluster is slow to create).
+
+      - name: Infra — init
+        working-directory: infra
+        run: |
+          terraform init \
+            -backend-config="bucket=teyavet-terraform-state-${ACCOUNT_ID}"
+
+      - name: Infra — delete orphaned RDS resources
+        run: |
+          # A DB subnet group cannot be moved to a different VPC.
+          # If a previous run left orphaned RDS resources tied to an old/deleted VPC,
+          # delete them now so Terraform can create fresh ones against the new VPC.
+          # All three commands are no-ops if the resource doesn't exist.
+
+          # Must delete the instance first; subnet group deletion fails if an instance uses it.
+          if aws rds describe-db-instances \
+               --db-instance-identifier teyavet-mysql \
+               --query 'DBInstances[0].DBInstanceIdentifier' \
+               --output text 2>/dev/null | grep -q teyavet-mysql; then
+            echo "Deleting RDS instance teyavet-mysql..."
+            aws rds delete-db-instance \
+              --db-instance-identifier teyavet-mysql \
+              --skip-final-snapshot \
+              --delete-automated-backups
+            echo "Waiting for deletion (up to 15 min)..."
+            aws rds wait db-instance-deleted --db-instance-identifier teyavet-mysql
+            echo "RDS instance deleted."
+          fi
+
+          aws rds delete-db-subnet-group \
+            --db-subnet-group-name teyavet-db-subnet-group 2>/dev/null || true
+
+          aws rds delete-db-parameter-group \
+            --db-parameter-group-name teyavet-mysql8 2>/dev/null || true
+
+      - name: Infra — apply
+        working-directory: infra
+        run: terraform apply -auto-approve -var="db_password=${{ secrets.DB_PASSWORD }}"
+
+      # ── Print outputs + update instructions ────────────────────────────────
+
+      - name: Print outputs and next steps
+        working-directory: infra
+        run: |
+          echo "## Terraform outputs" >> $GITHUB_STEP_SUMMARY
+          echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
+          terraform output >> $GITHUB_STEP_SUMMARY
+          echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
+
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "## GitHub Secrets to update" >> $GITHUB_STEP_SUMMARY
+          echo "Update these 4 secrets before running the Deploy to EKS workflow:" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Secret | New value |" >> $GITHUB_STEP_SUMMARY
+          echo "|--------|-----------|" >> $GITHUB_STEP_SUMMARY
+          echo "| \`RDS_HOST\` | \`$(terraform output -raw rds_host)\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| \`ECR_BACKEND_URL\` | \`$(terraform output -raw ecr_backend_url)\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| \`ECR_FRONTEND_URL\` | \`$(terraform output -raw ecr_frontend_url)\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| \`ALB_DNS\` | *(get from Deploy to EKS workflow after first deploy)* |" >> $GITHUB_STEP_SUMMARY

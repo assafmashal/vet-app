@@ -1,3 +1,4 @@
+# Manual deployment to EKS cluster
 name: Deploy to EKS
 
 on:

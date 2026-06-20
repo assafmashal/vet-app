@@ -1,3 +1,4 @@
+# Continuous Deployment — triggered on every push to master
 name: CD — Build, Push & Test
 
 on:

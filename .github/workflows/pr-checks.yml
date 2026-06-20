@@ -1,3 +1,4 @@
+# Lint and test checks for pull requests targeting master
 name: PR Checks
 
 on:

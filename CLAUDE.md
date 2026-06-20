@@ -2,6 +2,11 @@
 
 Full-stack veterinary clinic management system. Clinic staff manage pet owners, patient records, measurements, and appointments.
 
+## Git Rules
+
+- **Never** add `Co-Authored-By: Claude` or any Claude/AI co-author lines to commits.
+- Commit author must always be the user only — no AI attribution in commits, pushes, or PRs.
+
 ---
 
 ## Stack

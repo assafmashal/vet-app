@@ -4,6 +4,11 @@ name: CD — Build, Push & Test
 on:
   push:
     branches: [master]
+    paths:
+      - 'backend/**'
+      - 'frontend/**'
+      - 'db/**'
+      - 'docker-compose.yml'
 
 jobs:
   # ── Job 1: Build all images, run full test suite ─────────────────────────────

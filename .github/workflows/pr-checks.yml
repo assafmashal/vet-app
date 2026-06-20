@@ -6,6 +6,11 @@ on:
     types: [opened, synchronize, reopened]
     branches:
       - master
+    paths:
+      - 'backend/**'
+      - 'frontend/**'
+      - 'db/**'
+      - 'docker-compose.yml'
 
 jobs:
   frontend-lint:

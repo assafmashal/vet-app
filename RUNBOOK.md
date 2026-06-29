@@ -113,6 +113,70 @@ To deploy those new images to EKS: **Actions → Deploy to EKS → Run workflow*
 
 ---
 
+## Resuming after full teardown (S3 + DynamoDB deleted)
+
+If the Terraform state backend was deleted (S3 bucket + DynamoDB lock table), all Terraform state is lost. This means Terraform has no record of what was previously deployed — it will create everything fresh.
+
+### What was deleted
+
+| Resource | Name | Purpose |
+|----------|------|---------|
+| S3 bucket | `teyavet-terraform-state-<ACCOUNT_ID>` | Stores Terraform state files |
+| DynamoDB table | `teyavet-terraform-locks` | Prevents concurrent Terraform operations |
+
+These are created by the Terraform config in `infra/bootstrap/`.
+
+### What you need before starting
+
+1. **AWS credentials** configured locally (`aws configure`) or via GitHub OIDC
+2. **GitHub Secrets** already set (they don't change across teardowns):
+   - `AWS_ROLE_ARN` — GitHub Actions OIDC role ARN
+   - `ECR_BACKEND_URL` — `<ACCOUNT_ID>.dkr.ecr.us-east-1.amazonaws.com/teyavet/backend`
+   - `ECR_FRONTEND_URL` — `<ACCOUNT_ID>.dkr.ecr.us-east-1.amazonaws.com/teyavet/frontend`
+   - `DB_PASSWORD` — RDS master password
+   - `JWT_SECRET_KEY` — JWT signing key
+3. **GitHub OIDC resources** — the IAM OIDC provider and `teyavet-github-actions` role may still exist in AWS from the previous deployment (the destroy script preserves them by default). If they exist, the terraform-apply workflow handles re-importing them automatically.
+
+### Steps to bring everything back up
+
+**Option A — Via GitHub Actions (recommended):**
+
+Follow the same [full deployment order](#full-deployment-order) above. The `Terraform — Apply Infrastructure` workflow is fully idempotent:
+
+1. **Phase 1 (Bootstrap):** Recreates the S3 bucket and DynamoDB table, importing any that already exist
+2. **Phase 2 (Infra):** Provisions VPC, EKS, RDS, ECR, IAM from scratch (~15 min)
+
+Then push images (Step 3) and deploy to EKS (Step 4) as usual.
+
+**Option B — Locally:**
+
+```bash
+# 1. Bootstrap: recreate S3 + DynamoDB
+cd infra/bootstrap
+terraform init
+terraform apply
+
+# Note the bucket name from the output:
+#   teyavet-terraform-state-<ACCOUNT_ID>
+
+# 2. Provision infrastructure
+cd ../
+terraform init -backend-config="bucket=teyavet-terraform-state-<ACCOUNT_ID>"
+terraform apply -var="db_password=YOUR_PASSWORD"
+```
+
+### Important notes
+
+- **Terraform state is gone** — Terraform treats this as a greenfield deployment. Any AWS resources left over from the previous deployment (e.g., orphaned VPCs, RDS instances) may cause naming conflicts. The workflow handles common cases (orphaned RDS cleanup), but check the AWS console if apply fails.
+- **ECR images are gone** — After `terraform apply` recreates ECR repos, they're empty. Trigger the CD pipeline to push fresh images before deploying to EKS:
+  ```bash
+  git commit --allow-empty -m "[CI] - trigger ECR push" && git push origin master
+  ```
+- **Database is fresh** — RDS is recreated with an empty database. The deploy-eks workflow runs the migration job (`schema.sql` + `seed_data.sql`) automatically.
+- **ALB DNS changes** — The new ALB gets a new hostname. The deploy workflow handles CORS configuration automatically, so no manual secret updates are needed.
+
+---
+
 ## Tearing down
 
 Use the destroy script — it handles Kubernetes cleanup, Terraform destroy, and bootstrap resource deletion in the correct order:
